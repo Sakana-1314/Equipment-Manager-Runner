@@ -12,7 +12,7 @@ jobs:
     name: 检测变更路径
     runs-on: ubuntu-24.04
     outputs:
-      e2e: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.e2e == 'true' }}
+      e2e: ${{ github.event_name == 'workflow_dispatch' || steps.initial.outputs.initial == 'true' || steps.filter.outputs.e2e == 'true' }}
     steps:
       - name: 签出 Equipment-Manager 代码
         uses: actions/checkout@v7
@@ -20,6 +20,19 @@ jobs:
           repository: Sakana-1314/Equipment-Manager
           ref: ${{ github.event.client_payload.ref || 'main' }}
           token: ${{ secrets.PAT }}
+
+      - name: 判断是否为仓库首次推送
+        # 首次 push 的 before 是全零 SHA，paths-filter 无法对不存在的基线取 diff，
+        # 会把全部文件判为「无变更」而误跳过；此时直接全量运行。
+        id: initial
+        if: github.event_name == 'repository_dispatch'
+        env:
+          BEFORE: ${{ github.event.client_payload.before }}
+        run: |
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "initial=true" >> "$GITHUB_OUTPUT"
+            echo "首次推送（无基线），按全量变更处理"
+          fi
 
       - name: 检测变更路径
         id: filter
