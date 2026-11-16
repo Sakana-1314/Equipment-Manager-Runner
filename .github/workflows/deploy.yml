@@ -1,0 +1,107 @@
+name: 发布测试环境
+
+# 触发方式：仅本仓库 Actions 页「Run workflow」手动运行（公开仓库安全红线：
+# 不配置 push / pull_request 触发，机密不会暴露给不可信代码）。
+#
+# 流程：签出 Equipment-Manager → 构建前后端镜像 → docker save 打包 →
+# 经 SSH 送达测试服务器 → docker load → 更新 compose.yml → compose up -d（dbinit 幂等升级）。
+# 服务器信息与私钥一律走机密（SSH_HOST/SSH_PORT/SSH_USER/SSH_PRIVATE_KEY），严禁硬编码。
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_build:
+        description: 跳过构建，仅重新拉起容器（镜像已在本机）
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: 构建镜像并发布到测试服务器
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: 签出 Equipment-Manager 代码
+        uses: actions/checkout@v7
+        with:
+          repository: Sakana-1314/Equipment-Manager
+          token: ${{ secrets.PAT }}
+
+      - name: 设置 SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" | sed 's/\r$//' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # 服务器信息只在运行期展开，不落日志明文
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config <<EOF
+          Host tpm-server
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking yes
+          EOF
+
+      - name: 构建镜像
+        if: inputs.skip_build != 'true'
+        run: |
+          set -euo pipefail
+          docker build -t tpm/server:latest ./server
+          docker build -t tpm/web:latest ./web
+
+      - name: 打包镜像
+        if: inputs.skip_build != 'true'
+        run: |
+          set -euo pipefail
+          docker save tpm/server:latest tpm/web:latest | gzip > /tmp/tpm-images.tar.gz
+          du -h /tmp/tpm-images.tar.gz
+
+      - name: 传输镜像与编排文件
+        run: |
+          set -euo pipefail
+          ssh tpm-server 'mkdir -p /opt/tpm'
+          if [ "${{ inputs.skip_build }}" != "true" ]; then
+            scp /tmp/tpm-images.tar.gz tpm-server:/opt/tpm/images.tar.gz
+          fi
+          scp deploy/compose.yml tpm-server:/opt/tpm/compose.yml
+
+      - name: 加载镜像并更新服务
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.skip_build }}" != "true" ]; then
+            ssh tpm-server 'gunzip -c /opt/tpm/images.tar.gz | docker load && rm /opt/tpm/images.tar.gz'
+          fi
+          # .env 由首次部署时在服务器上手工创建（POSTGRES_PASSWORD/JWT_SECRET），缺失则报错拒绝启动
+          ssh tpm-server 'cd /opt/tpm && test -f .env || { echo "缺少 /opt/tpm/.env（POSTGRES_PASSWORD/JWT_SECRET），请先手工创建"; exit 1; } && docker compose up -d'
+          ssh tpm-server 'cd /opt/tpm && docker compose ps'
+
+      - name: 健康检查
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if ssh tpm-server 'curl -fsS http://127.0.0.1:24546/healthz >/dev/null 2>&1' \
+               && ssh tpm-server 'curl -fsS http://127.0.0.1:24545/ >/dev/null 2>&1'; then
+              echo "前后端均健康"
+              exit 0
+            fi
+            echo "等待服务就绪…($i/30)"
+            sleep 10
+          done
+          ssh tpm-server 'cd /opt/tpm && docker compose logs --tail=100'
+          echo "::error::健康检查超时"
+          exit 1

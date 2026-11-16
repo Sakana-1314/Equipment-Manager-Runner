@@ -1,0 +1,185 @@
+name: 基础测试
+
+# 由 Equipment-Manager 仓库的 trigger.yml 通过 repository_dispatch(equipment_pr) 触发。
+# 检出 Equipment-Manager 对应 commit 执行服务端与前端测试；checks 聚合后把状态回写到
+# 「PR 当前 head」（避免推进入库期间旧 head 的 status 失效），并以单条固定评论汇总门禁结果。
+on:
+  repository_dispatch:
+    types: [equipment_pr]
+
+jobs:
+  detect:
+    name: 检测变更路径
+    runs-on: ubuntu-24.04
+    outputs:
+      server: ${{ steps.filter.outputs.server == 'true' }}
+      web: ${{ steps.filter.outputs.web == 'true' }}
+    steps:
+      - name: 签出 Equipment-Manager 代码
+        uses: actions/checkout@v7
+        with:
+          repository: Sakana-1314/Equipment-Manager
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.PAT }}
+
+      - name: 检测变更路径
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          base: ${{ github.event.client_payload.before }}
+          ref: ${{ github.event.client_payload.ref }}
+          filters: |
+            server:
+              - 'server/**'
+              - 'docs/openapi.yaml'
+            web:
+              - 'web/**'
+              - 'docs/openapi.yaml'
+
+  server-tests:
+    name: 服务端测试
+    needs: detect
+    if: needs.detect.outputs.server == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - name: 签出 Equipment-Manager 代码
+        uses: actions/checkout@v7
+        with:
+          repository: Sakana-1314/Equipment-Manager
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.PAT }}
+
+      - name: 安装 Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache-dependency-path: server/go.sum
+
+      - name: Go 代码格式检查
+        run: test -z "$(gofmt -l .)"
+
+      - name: Go 代码检查
+        run: go vet ./...
+
+      - name: 运行全部测试（单测/集成/契约/E2E）
+        # 测试基座用 embedded-postgres 在测试进程内起真实 PostgreSQL 16（无需 Docker service）：
+        # 二进制首次从 Maven 中央仓库下载，缓存于 ~/.cache/tpm-embedded-postgres。
+        run: go test ./... -v
+
+      - name: 上传测试日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: server-test-logs
+          path: server/logs/
+          if-no-files-found: ignore
+
+  web-checks:
+    name: 前端检查
+    needs: detect
+    if: needs.detect.outputs.web == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - name: 签出 Equipment-Manager 代码
+        uses: actions/checkout@v7
+        with:
+          repository: Sakana-1314/Equipment-Manager
+          ref: ${{ github.event.client_payload.ref }}
+          token: ${{ secrets.PAT }}
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 代码检查
+        run: npm run lint
+
+      - name: 单元测试
+        run: npm run test
+
+      - name: 生产构建
+        run: npm run build
+
+  checks:
+    name: 测试通过检查
+    # 无论测试 job 是跳过还是失败都运行，聚合为明确的合并门禁结论，
+    # 并把状态回写到 PR 当前 head + 固定评论汇总。
+    if: always()
+    needs: [detect, server-tests, web-checks]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检查测试结果
+        run: |
+          results=(
+            "${{ needs.detect.result }}"
+            "${{ needs.server-tests.result }}"
+            "${{ needs.web-checks.result }}"
+          )
+          for r in "${results[@]}"; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::存在未通过的检查（$r），测试不通过不允许合并"
+              exit 1
+            fi
+          done
+          echo "全部检查通过"
+
+      - name: 回写测试状态到 Equipment-Manager
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.event.client_payload.repo }}
+        run: |
+          state=failure
+          if [ "${{ job.status }}" = "success" ]; then state=success; fi
+          HEAD="${{ github.event.client_payload.ref }}"
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+            CUR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null || true)"
+            if [ -n "$CUR" ]; then HEAD="$CUR"; fi
+          fi
+          # 按「回写」步骤名反查当前 job 的 ID，拼出可点击的运行链接
+          JOB_ID="$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(any(.steps[]; .name == "回写测试状态到 Equipment-Manager")) | .id' | head -1)"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/$RUN_ID/job/$JOB_ID"
+          gh api -X POST \
+            "repos/$REPO/statuses/$HEAD" \
+            -f state="$state" \
+            -f context='测试通过检查（Runner）' \
+            -f description='由 Equipment-Manager-Runner 仓库代为执行' \
+            -f target_url="$RUN_URL"
+
+          # 单条固定评论：先在 PR 上找固定标记的已有评论，存在则更新，否则新增
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+            MARKER='🤖 **Equipment-Manager-Runner** 门禁汇总'
+            state_text="✅"
+            [ "$state" = "success" ] || state_text="❌"
+            body="$(printf '%s\n\n- 测试通过检查（Runner）：%s\n  [查看测试 Job](%s)' \
+              "$MARKER" "$state_text" "$RUN_URL")"
+            existing="$(gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
+              --jq --arg m "$MARKER" '[.[] | select((.body // "") | contains($m))] | .[0].id // empty' || true)"
+            if [ -n "$existing" ]; then
+              jq -n --arg body "$body" '{body:$body}' | \
+                gh api -X PATCH "repos/$REPO/issues/comments/$existing" --input -
+            else
+              jq -n --arg body "$body" '{body:$body}' | \
+                gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" --input -
+            fi
+          fi

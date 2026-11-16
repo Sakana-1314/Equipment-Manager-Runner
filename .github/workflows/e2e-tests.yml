@@ -1,0 +1,83 @@
+name: 浏览器端到端测试
+
+# 由 Equipment-Manager 仓库的 trigger.yml 通过 repository_dispatch(equipment_push) 触发。
+# 跑 Playwright 浏览器核心闭环（登录改密 → 建档 → 点检 → 工单 → 领件 → 验收 → 看板）：
+# 编排由 web/e2e/support 自管理——编译后端、embedded-postgres、Vite 开发服务器。
+on:
+  repository_dispatch:
+    types: [equipment_push]
+
+jobs:
+  detect:
+    name: 检测变更路径
+    runs-on: ubuntu-24.04
+    outputs:
+      e2e: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.e2e == 'true' }}
+    steps:
+      - name: 签出 Equipment-Manager 代码
+        uses: actions/checkout@v7
+        with:
+          repository: Sakana-1314/Equipment-Manager
+          ref: ${{ github.event.client_payload.ref || 'main' }}
+          token: ${{ secrets.PAT }}
+
+      - name: 检测变更路径
+        id: filter
+        if: github.event_name == 'repository_dispatch'
+        uses: dorny/paths-filter@v4
+        with:
+          base: ${{ github.event.client_payload.before }}
+          ref: ${{ github.event.client_payload.ref }}
+          filters: |
+            e2e:
+              - 'server/**'
+              - 'web/**'
+              - 'docs/openapi.yaml'
+
+  e2e:
+    name: 浏览器核心闭环
+    needs: detect
+    if: needs.detect.outputs.e2e == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - name: 签出 Equipment-Manager 代码
+        uses: actions/checkout@v7
+        with:
+          repository: Sakana-1314/Equipment-Manager
+          ref: ${{ github.event.client_payload.ref || 'main' }}
+          token: ${{ secrets.PAT }}
+
+      - name: 安装 Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache-dependency-path: server/go.sum
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖与 Playwright 浏览器
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: 运行浏览器端到端测试
+        run: npm run e2e
+
+      - name: 上传失败截图与追踪
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            web/playwright-report/
+            web/e2e/.artifacts/
+          if-no-files-found: ignore
