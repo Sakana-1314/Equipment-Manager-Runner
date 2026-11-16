@@ -6,6 +6,7 @@ name: 浏览器端到端测试
 on:
   repository_dispatch:
     types: [equipment_push]
+  workflow_dispatch:
 
 jobs:
   detect:
