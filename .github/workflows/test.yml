@@ -87,6 +87,10 @@ jobs:
       run:
         working-directory: web
 
+    env:
+      # 业务基准时区为 Asia/Shanghai：格式化类单测断言依赖 +08:00，CI 跑在 UTC 需固定
+      TZ: Asia/Shanghai
+
     steps:
       - name: 签出 Equipment-Manager 代码
         uses: actions/checkout@v7
