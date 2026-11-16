@@ -13,8 +13,8 @@ jobs:
     name: 检测变更路径
     runs-on: ubuntu-24.04
     outputs:
-      server: ${{ steps.filter.outputs.server == 'true' }}
-      web: ${{ steps.filter.outputs.web == 'true' }}
+      server: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.server == 'true' }}
+      web: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.web == 'true' }}
     steps:
       - name: 签出 Equipment-Manager 代码
         uses: actions/checkout@v7
