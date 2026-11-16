@@ -6,6 +6,7 @@ name: 基础测试
 on:
   repository_dispatch:
     types: [equipment_pr]
+  workflow_dispatch:
 
 jobs:
   detect:
