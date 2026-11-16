@@ -155,7 +155,13 @@ jobs:
         run: |
           state=failure
           if [ "${{ job.status }}" = "success" ]; then state=success; fi
+          PR_NUMBER="${{ github.event.client_payload.pr_number }}"
           HEAD="${{ github.event.client_payload.ref }}"
+          # 手动触发无 PR/ref 上下文：测试已在上面跑完，无需回写状态
+          if [ -z "$HEAD" ] && { [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; }; then
+            echo "手动触发（无 PR 上下文），跳过状态回写"
+            exit 0
+          fi
           if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
             CUR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null || true)"
             if [ -n "$CUR" ]; then HEAD="$CUR"; fi
